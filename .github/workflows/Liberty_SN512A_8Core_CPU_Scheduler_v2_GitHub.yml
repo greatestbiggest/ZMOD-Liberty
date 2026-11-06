@@ -1,0 +1,487 @@
+name: Liberty SN512A - Eight-Core Friendly CPU Scheduler v2
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-apk:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      LIBERTY_GPU: mali
+      LIBERTY_CPU: compatible
+      NDK_VER: 29.0.14206865
+      STRIP: '1'
+    steps:
+      - name: Checkout official Mali Edition source
+        uses: actions/checkout@v4
+        with:
+          repository: prollynotzjay/ZMOD-Liberty
+          ref: mali-dimensity-8400
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Allow long Windows paths
+        run: git config --system core.longpaths true
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: CMake and Ninja
+        run: python -m pip install 'cmake>=3.29,<5' ninja
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK 35 and NDK r29
+        run: |
+          SDKMANAGER="$(cygpath -u "$ANDROID_HOME")/cmdline-tools/latest/bin/sdkmanager.bat"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VER" "platforms;android-35" "build-tools;35.0.0"
+      - name: Apply SN512A startup menu and tuning changes
+        run: |
+          cat > "sn512a_patch_launcher.py" <<'PY'
+          #!/usr/bin/env python3
+          """SN512A launcher customization for ZMOD-Liberty mali-dimensity-8400.
+          Fail closed on drift; patch only documented cvar UI, not proprietary GPU drivers.
+          """
+          from pathlib import Path
+          import sys
+          
+          TARGET = Path('os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java')
+          TAG = 'SN512A-TOOLS-V1'
+          
+          def once(source: str, old: str, new: str, name: str) -> str:
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{name}: expected exactly 1 occurrence, got {count}; upstream changed')
+              return source.replace(old, new, 1)
+          
+          def apply(source: str) -> str:
+              if TAG in source:
+                  print('Already applied; no changes')
+                  return source
+              # Actual Java launcher from the Mali branch, not an independent settings app.
+              source = once(source,
+                 'String[] tabNames = {"Display", "Performance", "Touch"};',
+                 'String[] tabNames = {"Display", "Performance", "Audio", "Touch"};', 'tab names')
+              source = once(source,
+                 'TextView view = text(tabNames[t], 19, R.color.picker_muted);',
+                 'TextView view = text(tabNames[t], 16, R.color.picker_muted);', 'tab label size')
+              source = once(source,'params.rightMargin = dp(26);', 'params.rightMargin = dp(12);', 'tab spacing')
+              # Separate density controls. Existing graphics.txt retains individual values.
+              start = source.index('new GraphicsSetting("Population density"')
+              end = source.index('new GraphicsSetting("Shadow quality"',start)
+              assert end > start
+              density = '''// SN512A-TOOLS-V1: Independent CPU-heavy population controls.
+          new GraphicsSetting("Moving traffic", "Traffic costs CPU time in crowded areas",
+              new String[] {"gta4_traffic_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Parked cars", "Reduce static traffic objects",
+              new String[] {"gta4_parked_car_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Pedestrians", "Lower CPU-intensive NPC simulation",
+              new String[] {"gta4_ped_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Scenario NPCs", "Sitting and scripted background characters",
+              new String[] {"gta4_scenario_ped_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          '''
+              source = source[:start]+density+source[end:]
+              start=source.index('new GraphicsSetting("Shadow quality"')
+              end=source.index('new GraphicsSetting("Motion blur"',start)
+              section=source[start:end]
+              section=once(section,'new String[] {"Default", "Console", "High"}',
+                 'new String[] {"Default", "Low 128", "Console 256", "High 512"}', 'shadow labels')
+              section=once(section,'new String[] {"256", "512"}',
+                 'new String[] {"128", "256", "512"}', 'shadow values')
+              source=source[:start]+section+source[end:]
+              additional='''// SN512A-TOOLS-V1: More launcher controls; all cvars documented upstream.
+          new GraphicsSetting("Audio buffer", "32=170ms, 48=256ms, 64=340ms; higher may prevent brief cuts",
+              new String[] {"audio_maxqframes"},
+              new String[] {"Default", "16 (85ms)", "24 (128ms)", "32 (170ms)", "48 (256ms)", "64 (340ms)"},
+              new String[] {"16", "24", "32", "48", "64"}),
+          new GraphicsSetting("Pin hot CPU threads", "Experimental: reserve fast cores for busy work; not always faster",
+              new String[] {"android_pin_hot_threads"},
+              new String[] {"Default", "Off (scheduler)", "On (test)"},
+              new String[] {"false", "true"}),
+          new GraphicsSetting("Dynamic draw distance", "Automatic distance adjustment when frames miss budget",
+              new String[] {"gta4_dynamic_draw_distance"},
+              new String[] {"Default", "On", "Off"},
+              new String[] {"true", "false"}),
+          new GraphicsSetting("Dynamic distance floor", "How far automatic draw distance can decrease",
+              new String[] {"gta4_dynamic_draw_distance_min"},
+              new String[] {"Default", "45%", "55%", "65%", "80%"},
+              new String[] {"0.45", "0.55", "0.65", "0.80"}),
+          new GraphicsSetting("Shadow object filter", "Skip tiny shadow draws; can remove small-object shadows",
+              new String[] {"gta4_native_shadow_min_indices"},
+              new String[] {"Default", "Off", "Light 150", "Medium 300", "High 600"},
+              new String[] {"0", "150", "300", "600"}),
+          new GraphicsSetting("Water reflection filter", "Reduce tiny reflection draws; some details disappear",
+              new String[] {"gta4_native_water_reflection_min_indices"},
+              new String[] {"Default", "Off", "Light 150", "Medium 300", "High 600"},
+              new String[] {"0", "150", "300", "600"}),
+          new GraphicsSetting("Reflection range", "Near reduces objects processed in reflections",
+              new String[] {"gta4_reflection_capture_distance"},
+              new String[] {"Default", "Near", "Original", "Extended", "Far"},
+              new String[] {"near", "original", "extended", "far"}),
+          new GraphicsSetting("FPS reflection guard", "Adaptive reflection update when below 30 FPS",
+              new String[] {"gta4_fps_guard"},
+              new String[] {"Default", "Off", "Level 1", "Level 2", "Level 3"},
+              new String[] {"0", "1", "2", "3"}),
+          new GraphicsSetting("Render queue", "1 reduces latency, 3 may improve throughput",
+              new String[] {"gta4_native_max_queued_frames"},
+              new String[] {"Default", "1", "2", "3", "4"},
+              new String[] {"1", "2", "3", "4"}),
+          new GraphicsSetting("Vertex cache reorder", "Runs triangle ordering work in background",
+              new String[] {"gta4_native_vertex_cache_order"},
+              new String[] {"Default", "On", "Off"},
+              new String[] {"true", "false"}),
+          '''
+              source=once(source,'new GraphicsSetting("Touch controls",',additional+'new GraphicsSetting("Touch controls",','extra settings')
+              # Separate audio from performance, preserve controller tab behavior.
+              source=once(source,'/** Which tab a setting belongs on: 0 Display, 1 Performance, 2 Touch. */',
+                          '/** Tabs: 0 Display, 1 Performance, 2 Audio, 3 Touch. */','tab help')
+              source=once(source,'if (setting.cvars[0].startsWith("gta4_touch")) return 2;',
+                 'if (setting.cvars[0].startsWith("gta4_touch")) return 3;\n'
+                 'if (setting.cvars[0].startsWith("audio_")) return 2;', 'tab routing')
+              source=once(source,'case "Population density":', '''case "Moving traffic":
+          case "Parked cars":
+          case "Pedestrians":
+          case "Scenario NPCs":
+          case "Dynamic draw distance":
+          case "Dynamic distance floor":
+          case "Pin hot CPU threads":
+          case "FPS reflection guard":
+          case "Render queue":
+          case "Vertex cache reorder":''','performance group')
+              # One-tap optional preset. Don't change working settings without user pressing it.
+              preset='''// SN512A-TOOLS-V1: optional preset, never forced onto existing installs.
+          Button sn512aPreset = button("SN512A BALANCED PRESET", false);
+          sn512aPreset.setOnClickListener(v -> {
+              for (int i = 0; i < GRAPHICS_SETTINGS.length; ++i) {
+                  GraphicsSetting item = GRAPHICS_SETTINGS[i];
+                  String key = item.cvars[0];
+                  String want = null;
+                  switch (key) {
+                      case "gta4_output_height_cap": want = "720"; break;
+                      case "gta4_draw_distance_scale": want = "0.6"; break;
+                      case "gta4_traffic_density_scale": want = "0.3"; break;
+                      case "gta4_parked_car_density_scale": want = "0.3"; break;
+                      case "gta4_ped_density_scale": want = "0.4"; break;
+                      case "gta4_scenario_ped_density_scale": want = "0.4"; break;
+                      case "gta4_shadow_map_base_size": want = "256"; break;
+                      case "audio_maxqframes": want = "64"; break;
+                      case "android_performance_hint_target_ms": want = "25"; break;
+                      case "android_thermal_guard": want = "true"; break;
+                      default: break;
+                  }
+                  if (want == null) continue;
+                  for (int j = 0; j < item.values.length; ++j) {
+                      if (want.equals(item.values[j])) {
+                          mGraphicsSpinners[i].setSelection(j + 1, false);
+                          mGraphicsPositions[i] = j + 1;
+                          break;
+                      }
+                  }
+              }
+              markSettingsChanged();
+              toast("SN512A preset selected. Save changes, then Play.");
+          });
+          LinearLayout.LayoutParams sn512aParams = new LinearLayout.LayoutParams(
+              ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+          sn512aParams.topMargin = dp(10);
+          card.addView(sn512aPreset, sn512aParams);
+          '''
+              anchor='Button reset = button("RESET TO DEFAULT", false);'
+              source=once(source,anchor,preset+anchor,'preset button')
+              assert source.count(TAG)>=3
+              assert source.count('new GraphicsSetting(') > 20
+              return source
+          
+          def main() -> None:
+              if not TARGET.is_file():
+                  raise SystemExit(f'Missing {TARGET}; check upstream branch')
+              original=TARGET.read_text(encoding='utf-8')
+              updated=apply(original)
+              if updated!=original:
+                  TARGET.write_text(updated,encoding='utf-8',newline='\n')
+              print(f'Launcher patch applied; {updated.count("new GraphicsSetting(")} settings; '
+                    f'{len(updated)} Java chars')
+          
+          if __name__=='__main__':
+              main()
+          PY
+          python "sn512a_patch_launcher.py"
+          git diff --stat
+          git diff --check
+          # Fail if patch made no changes.
+          git diff --quiet -- os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java && exit 1 || true
+      - name: Add SN512A CPU scheduling policy to game process
+        run: |
+          cat > sn512a_patch_cpu_scheduler.py <<'PY'
+          #!/usr/bin/env python3
+          """Patch the upstream Mali branch for an optional, app-local CPU scheduler.
+          Fails safely on upstream drift. Runtime mode is consumed by Android Java,
+          not passed as an unknown cvar into the game engine.
+          """
+          from pathlib import Path
+          
+          ROOT=Path('os/android/app/src/main/java/com/libertyrecomp')
+          L=ROOT/'LauncherActivity.java'
+          A=ROOT/'LibertyActivity.java'
+          TAG='SN512A-CPU-SCHED-V2'
+          
+          def once(src, old, new, label):
+              n=src.count(old)
+              if n!=1: raise RuntimeError(f'{label}: expected 1 anchor, found {n}')
+              return src.replace(old,new,1)
+          
+          def modify_launcher(src):
+              if TAG in src: return src
+              setting='''// SN512A-CPU-SCHED-V2: Experimental native thread-priority policy.
+                      new GraphicsSetting("SN512A CPU scheduler",
+                              "Prioritize audio and recognized render/texture threads; Android still schedules cores",
+                              new String[] {"sn512a_cpu_mode"},
+                              new String[] {"Default (balanced on SN512A)", "Off", "Balanced", "Performance"},
+                              new String[] {"off", "balanced", "performance"}),
+                      '''
+              src=once(src,'new GraphicsSetting("Touch controls",',setting+'new GraphicsSetting("Touch controls",','launcher menu anchor')
+              # Put the new selector alongside the already present performance controls.
+              src=once(src,'case "Pin hot CPU threads":', 'case "SN512A CPU scheduler":\n            case "Pin hot CPU threads":','performance tab')
+              return src
+          
+          def modify_activity(src):
+              if TAG in src: return src
+              src=once(src,'private String[] mArguments = new String[0];',
+                       'private String[] mArguments = new String[0];\n'
+                       '    // SN512A-CPU-SCHED-V2: local Java policy, not a GTA cvar.\n'
+                       '    private String mSn512aCpuMode = "off";\n'
+                       '    private Sn512aCpuScheduler mSn512aScheduler;', 'activity field')
+              src=once(src,'super.onCreate(savedInstanceState);',
+                       'super.onCreate(savedInstanceState);\n'
+                       '        if (!"off".equals(mSn512aCpuMode)) {\n'
+                       '            mSn512aScheduler = new Sn512aCpuScheduler(mSn512aCpuMode);\n'
+                       '            mSn512aScheduler.start();\n'
+                       '        }','activity startup')
+              src=once(src,'    /**\n     * Picks the Vulkan driver before SDL loads libmain.so;',
+                       '    @Override\n'
+                       '    protected void onDestroy() {\n'
+                       '        if (mSn512aScheduler != null) mSn512aScheduler.stop();\n'
+                       '        super.onDestroy();\n'
+                       '    }\n'
+                       '    /**\n     * Picks the Vulkan driver before SDL loads libmain.so;', 'activity teardown')
+              src=once(src,'mArguments = withoutDuplicateOptions(arguments).toArray(new String[0]);',
+                       '''// SN512A-CPU-SCHED-V2: consume Java-side setting before native parsing.
+                  // Existing graphics.txt selections override args.txt, if present.
+                  String requestedCpuMode = null;
+                  for (String arg : arguments) {
+                      if (arg.startsWith("--sn512a_cpu_mode=")) {
+                          requestedCpuMode = arg.substring("--sn512a_cpu_mode=".length());
+                      }
+                  }
+                  arguments.removeIf(arg -> arg.startsWith("--sn512a_cpu_mode="));
+                  // Enabled by default only on the tested MediaTek device family.
+                  boolean sn512a = "SN512A".equalsIgnoreCase(Build.MODEL)
+                          && "mt6835".equalsIgnoreCase(Build.HARDWARE);
+                  String chosen = requestedCpuMode != null ? requestedCpuMode : (sn512a ? "balanced" : "off");
+                  mSn512aCpuMode = ("balanced".equals(chosen) || "performance".equals(chosen))
+                          ? chosen : "off";
+                  Log.i(TAG, "SN512A CPU policy=" + mSn512aCpuMode);
+                  mArguments = withoutDuplicateOptions(arguments).toArray(new String[0]);''', 'native arg handoff')
+              return src
+          
+          def main():
+              for path in [L,A]:
+                  if not path.is_file(): raise SystemExit(f'Missing {path}; branch/path mismatch')
+              old_l=L.read_text(encoding='utf8'); old_a=A.read_text(encoding='utf8')
+              new_l=modify_launcher(old_l); new_a=modify_activity(old_a)
+              if TAG not in new_l or TAG not in new_a: raise SystemExit('CPU patch marker missing')
+              # Only write after *both* modifications validate, to avoid half-patching.
+              L.write_text(new_l,encoding='utf8',newline='\n'); A.write_text(new_a,encoding='utf8',newline='\n')
+              sched=Path(__file__).resolve().parent/'Sn512aCpuScheduler.java'
+              target=ROOT/sched.name
+              target.write_bytes(sched.read_bytes())
+              print('SN512A CPU scheduler v2: launcher + activity + scheduler patched')
+          
+          if __name__=='__main__': main()
+          PY
+          cat > Sn512aCpuScheduler.java <<'JAVA'
+          package com.libertyrecomp;
+          
+          import android.os.Process;
+          import android.util.Log;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          
+          /**
+           * SN512A experiment: modest thread-priority hints, not hard core assignments.
+           * Android remains responsible for assigning threads to the eight CPU cores.
+           * This cannot parallelize GTA's single-thread-dependent physics or game logic.
+           * Only act on recognizable game-owned native thread names; never change
+           * Android, Binder, GC, driver, or unrelated app threads.
+           */
+          final class Sn512aCpuScheduler implements Runnable {
+              private static final String TAG = "SN512A-CPU";
+              private final boolean performance;
+              private final Map<Integer, Integer> applied = new HashMap<>();
+              private volatile boolean running;
+              private Thread monitor;
+          
+              Sn512aCpuScheduler(String mode) {
+                  this.performance = "performance".equals(mode);
+              }
+          
+              synchronized void start() {
+                  if (running) return;
+                  running = true;
+                  monitor = new Thread(this, "SN512A-CPU-Monitor");
+                  // The monitor must not contend with game-critical work.
+                  monitor.setPriority(Thread.MIN_PRIORITY);
+                  monitor.setDaemon(true);
+                  monitor.start();
+                  Log.i(TAG, "CPU priority experiment active, mode=" + (performance ? "performance" : "balanced"));
+              }
+          
+              synchronized void stop() {
+                  running = false;
+                  if (monitor != null) monitor.interrupt();
+              }
+          
+              @Override public void run() {
+                  // Android applies affinity and performance hints through its own scheduler;
+                  // this code only requests a priority for known native game threads.
+                  while (running) {
+                      try {
+                          scan();
+                          Thread.sleep(1500);
+                      } catch (InterruptedException ignored) {
+                          break;
+                      } catch (Exception e) {
+                          Log.w(TAG, "scan skipped: " + e.getClass().getSimpleName());
+                          try { Thread.sleep(3000); } catch (InterruptedException stop) { break; }
+                      }
+                  }
+                  applied.clear();
+              }
+          
+              private void scan() {
+                  File[] tasks = new File("/proc/self/task").listFiles();
+                  if (tasks == null) return;
+                  Map<Integer, Integer> currentIds = new HashMap<>();
+                  for (File task : tasks) {
+                      final int tid;
+                      try { tid = Integer.parseInt(task.getName()); }
+                      catch (NumberFormatException ignored) { continue; }
+                      currentIds.put(tid, 1);
+                      String name = readFirstLine(new File(task, "comm"));
+                      if (name == null) continue;
+                      int requested = desiredNice(name);
+                      if (requested == Integer.MAX_VALUE) continue;
+                      // Do not repeatedly reapply identical priorities, or lower a
+                      // priority that the existing engine/audio code has already raised.
+                      try {
+                          int existing = Process.getThreadPriority(tid);
+                          if (existing <= requested) continue;
+                          Integer prior = applied.get(tid);
+                          if (prior != null && prior <= requested) continue;
+                          Process.setThreadPriority(tid, requested);
+                          applied.put(tid, requested);
+                          Log.i(TAG, "nice " + tid + " " + name + " " + existing + " -> " + requested);
+                      } catch (IllegalArgumentException | SecurityException e) {
+                          Log.w(TAG, "priority request denied for " + tid + " (" + name + ")");
+                      } catch (RuntimeException e) {
+                          Log.w(TAG, "priority request failed: " + e.getClass().getSimpleName());
+                      }
+                  }
+                  applied.keySet().retainAll(currentIds.keySet());
+              }
+          
+              /** Lower nice means higher priority; existing -16 audio priority is preserved. */
+              private int desiredNice(String original) {
+                  String name = original.trim().toLowerCase(Locale.ROOT);
+                  // Android thread names may be truncated to 15 characters in comm.
+                  if (name.equals("audio worker") || name.startsWith("xma decoder") ||
+                          name.startsWith("audio decode")) return -16;
+                  if (name.startsWith("gtarecorder") || name.startsWith("gtaworker") ||
+                          name.startsWith("gta recorder") || name.startsWith("render worker")) {
+                      return performance ? -8 : -5;
+                  }
+                  if (name.startsWith("texture") || name.startsWith("asset") ||
+                          name.startsWith("vertex cache") || name.startsWith("shader worker")) {
+                      return performance ? -3 : -1;
+                  }
+                  return Integer.MAX_VALUE;
+              }
+          
+              private static String readFirstLine(File file) {
+                  try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                          new FileInputStream(file), StandardCharsets.UTF_8))) {
+                      return r.readLine();
+                  } catch (Exception ignored) { return null; }
+              }
+          }
+          JAVA
+          python sn512a_patch_cpu_scheduler.py
+          git diff --check
+          git diff --stat
+          test -s os/android/app/src/main/java/com/libertyrecomp/Sn512aCpuScheduler.java
+      - name: Restore native build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out/build
+            out/host-tools
+          key: liberty-sn512a-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-${{ github.sha }}
+          restore-keys: |
+            liberty-sn512a-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-
+      - name: Fetch pinned dependencies and apply patches
+        run: python tools/setup_repo.py
+      - name: Build Vulkan driver proxy
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          bash os/android/scripts/build_driver_proxy.sh
+      - name: Build native game and renderer
+        timeout-minutes: 320
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          bash os/android/scripts/build_native.sh
+      - name: Save native cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out/build
+            out/host-tools
+          key: liberty-sn512a-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-${{ github.sha }}
+      - name: Build debug APK
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          rm -f os/android/app/build/outputs/apk/debug/app-debug.apk
+          bash os/android/scripts/build_apk.sh debug
+          test -s os/android/app/build/outputs/apk/debug/app-debug.apk
+          cp os/android/app/build/outputs/apk/debug/app-debug.apk Liberty-SN512A-CPU-Scheduler-v2-EXPERIMENTAL.apk
+      - name: Upload experimental Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-SN512A-CPU-Scheduler-v2-EXPERIMENTAL
+          path: Liberty-SN512A-CPU-Scheduler-v2-EXPERIMENTAL.apk
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,920 @@
+name: Liberty SN512A - Memory & Audio v4.1 (audio callback build fix)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-apk:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      LIBERTY_GPU: mali
+      LIBERTY_CPU: compatible
+      NDK_VER: 29.0.14206865
+      STRIP: '1'
+    steps:
+      - name: Checkout official Mali Edition source
+        uses: actions/checkout@v4
+        with:
+          repository: prollynotzjay/ZMOD-Liberty
+          ref: mali-dimensity-8400
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Allow long Windows paths
+        run: git config --system core.longpaths true
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: CMake and Ninja
+        run: python -m pip install 'cmake>=3.29,<5' ninja
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Restore consistent debug signing key (optional)
+        env:
+          LIBERTY_DEBUG_KEYSTORE_B64: ${{ secrets.LIBERTY_DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$LIBERTY_DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$LIBERTY_DEBUG_KEYSTORE_B64" | base64 --decode > "$HOME/.android/debug.keystore"
+            test -s "$HOME/.android/debug.keystore"
+            echo "Signing with the provided persistent debug key."
+          else
+            echo "WARNING: no persistent key provided; a new runner debug key may not install as an update."
+            echo "Do not uninstall the current working game without a verified app-data backup."
+          fi
+      - name: Android SDK 35 and NDK r29
+        run: |
+          SDKMANAGER="$(cygpath -u "$ANDROID_HOME")/cmdline-tools/latest/bin/sdkmanager.bat"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "ndk;$NDK_VER" "platforms;android-35" "build-tools;35.0.0"
+      - name: Apply SN512A startup menu and tuning changes
+        run: |
+          cat > "sn512a_patch_launcher.py" <<'PY'
+          #!/usr/bin/env python3
+          """SN512A launcher customization for ZMOD-Liberty mali-dimensity-8400.
+          Fail closed on drift; patch only documented cvar UI, not proprietary GPU drivers.
+          """
+          from pathlib import Path
+          import sys
+          
+          TARGET = Path('os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java')
+          TAG = 'SN512A-TOOLS-V1'
+          
+          def once(source: str, old: str, new: str, name: str) -> str:
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{name}: expected exactly 1 occurrence, got {count}; upstream changed')
+              return source.replace(old, new, 1)
+          
+          def apply(source: str) -> str:
+              if TAG in source:
+                  print('Already applied; no changes')
+                  return source
+              # Actual Java launcher from the Mali branch, not an independent settings app.
+              source = once(source,
+                 'String[] tabNames = {"Display", "Performance", "Touch"};',
+                 'String[] tabNames = {"Display", "Performance", "Audio", "Touch"};', 'tab names')
+              source = once(source,
+                 'TextView view = text(tabNames[t], 19, R.color.picker_muted);',
+                 'TextView view = text(tabNames[t], 16, R.color.picker_muted);', 'tab label size')
+              source = once(source,'params.rightMargin = dp(26);', 'params.rightMargin = dp(12);', 'tab spacing')
+              # Separate density controls. Existing graphics.txt retains individual values.
+              start = source.index('new GraphicsSetting("Population density"')
+              end = source.index('new GraphicsSetting("Shadow quality"',start)
+              assert end > start
+              density = '''// SN512A-TOOLS-V1: Independent CPU-heavy population controls.
+          new GraphicsSetting("Moving traffic", "Traffic costs CPU time in crowded areas",
+              new String[] {"gta4_traffic_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Parked cars", "Reduce static traffic objects",
+              new String[] {"gta4_parked_car_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Pedestrians", "Lower CPU-intensive NPC simulation",
+              new String[] {"gta4_ped_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          new GraphicsSetting("Scenario NPCs", "Sitting and scripted background characters",
+              new String[] {"gta4_scenario_ped_density_scale"},
+              new String[] {"Default", "20%", "30%", "40%", "60%", "80%", "Console 100%"},
+              new String[] {"0.2", "0.3", "0.4", "0.6", "0.8", "1.0"}),
+          '''
+              source = source[:start]+density+source[end:]
+              start=source.index('new GraphicsSetting("Shadow quality"')
+              end=source.index('new GraphicsSetting("Motion blur"',start)
+              section=source[start:end]
+              section=once(section,'new String[] {"Default", "Console", "High"}',
+                 'new String[] {"Default", "Low 128", "Console 256", "High 512"}', 'shadow labels')
+              section=once(section,'new String[] {"256", "512"}',
+                 'new String[] {"128", "256", "512"}', 'shadow values')
+              source=source[:start]+section+source[end:]
+              additional='''// SN512A-TOOLS-V1: More launcher controls; all cvars documented upstream.
+          new GraphicsSetting("Audio buffer", "32=170ms, 48=256ms, 64=340ms; higher may prevent brief cuts",
+              new String[] {"audio_maxqframes"},
+              new String[] {"Default", "16 (85ms)", "24 (128ms)", "32 (170ms)", "48 (256ms)", "64 (340ms)"},
+              new String[] {"16", "24", "32", "48", "64"}),
+          new GraphicsSetting("Pin hot CPU threads", "Experimental: reserve fast cores for busy work; not always faster",
+              new String[] {"android_pin_hot_threads"},
+              new String[] {"Default", "Off (scheduler)", "On (test)"},
+              new String[] {"false", "true"}),
+          new GraphicsSetting("Dynamic draw distance", "Automatic distance adjustment when frames miss budget",
+              new String[] {"gta4_dynamic_draw_distance"},
+              new String[] {"Default", "On", "Off"},
+              new String[] {"true", "false"}),
+          new GraphicsSetting("Dynamic distance floor", "How far automatic draw distance can decrease",
+              new String[] {"gta4_dynamic_draw_distance_min"},
+              new String[] {"Default", "45%", "55%", "65%", "80%"},
+              new String[] {"0.45", "0.55", "0.65", "0.80"}),
+          new GraphicsSetting("Shadow object filter", "Skip tiny shadow draws; can remove small-object shadows",
+              new String[] {"gta4_native_shadow_min_indices"},
+              new String[] {"Default", "Off", "Light 150", "Medium 300", "High 600"},
+              new String[] {"0", "150", "300", "600"}),
+          new GraphicsSetting("Water reflection filter", "Reduce tiny reflection draws; some details disappear",
+              new String[] {"gta4_native_water_reflection_min_indices"},
+              new String[] {"Default", "Off", "Light 150", "Medium 300", "High 600"},
+              new String[] {"0", "150", "300", "600"}),
+          new GraphicsSetting("Reflection range", "Near reduces objects processed in reflections",
+              new String[] {"gta4_reflection_capture_distance"},
+              new String[] {"Default", "Near", "Original", "Extended", "Far"},
+              new String[] {"near", "original", "extended", "far"}),
+          new GraphicsSetting("FPS reflection guard", "Adaptive reflection update when below 30 FPS",
+              new String[] {"gta4_fps_guard"},
+              new String[] {"Default", "Off", "Level 1", "Level 2", "Level 3"},
+              new String[] {"0", "1", "2", "3"}),
+          new GraphicsSetting("Render queue", "1 reduces latency, 3 may improve throughput",
+              new String[] {"gta4_native_max_queued_frames"},
+              new String[] {"Default", "1", "2", "3", "4"},
+              new String[] {"1", "2", "3", "4"}),
+          new GraphicsSetting("Vertex cache reorder", "Runs triangle ordering work in background",
+              new String[] {"gta4_native_vertex_cache_order"},
+              new String[] {"Default", "On", "Off"},
+              new String[] {"true", "false"}),
+          '''
+              source=once(source,'new GraphicsSetting("Touch controls",',additional+'new GraphicsSetting("Touch controls",','extra settings')
+              # Separate audio from performance, preserve controller tab behavior.
+              source=once(source,'/** Which tab a setting belongs on: 0 Display, 1 Performance, 2 Touch. */',
+                          '/** Tabs: 0 Display, 1 Performance, 2 Audio, 3 Touch. */','tab help')
+              source=once(source,'if (setting.cvars[0].startsWith("gta4_touch")) return 2;',
+                 'if (setting.cvars[0].startsWith("gta4_touch")) return 3;\n'
+                 'if (setting.cvars[0].startsWith("audio_")) return 2;', 'tab routing')
+              source=once(source,'case "Population density":', '''case "Moving traffic":
+          case "Parked cars":
+          case "Pedestrians":
+          case "Scenario NPCs":
+          case "Dynamic draw distance":
+          case "Dynamic distance floor":
+          case "Pin hot CPU threads":
+          case "FPS reflection guard":
+          case "Render queue":
+          case "Vertex cache reorder":''','performance group')
+              # One-tap optional preset. Don't change working settings without user pressing it.
+              preset='''// SN512A-TOOLS-V1: optional preset, never forced onto existing installs.
+          Button sn512aPreset = button("SN512A BALANCED PRESET", false);
+          sn512aPreset.setOnClickListener(v -> {
+              for (int i = 0; i < GRAPHICS_SETTINGS.length; ++i) {
+                  GraphicsSetting item = GRAPHICS_SETTINGS[i];
+                  String key = item.cvars[0];
+                  String want = null;
+                  switch (key) {
+                      case "gta4_output_height_cap": want = "720"; break;
+                      case "gta4_draw_distance_scale": want = "0.6"; break;
+                      case "gta4_traffic_density_scale": want = "0.3"; break;
+                      case "gta4_parked_car_density_scale": want = "0.3"; break;
+                      case "gta4_ped_density_scale": want = "0.4"; break;
+                      case "gta4_scenario_ped_density_scale": want = "0.4"; break;
+                      case "gta4_shadow_map_base_size": want = "256"; break;
+                      case "audio_maxqframes": want = "64"; break;
+                      case "android_performance_hint_target_ms": want = "25"; break;
+                      case "android_thermal_guard": want = "true"; break;
+                      default: break;
+                  }
+                  if (want == null) continue;
+                  for (int j = 0; j < item.values.length; ++j) {
+                      if (want.equals(item.values[j])) {
+                          mGraphicsSpinners[i].setSelection(j + 1, false);
+                          mGraphicsPositions[i] = j + 1;
+                          break;
+                      }
+                  }
+              }
+              markSettingsChanged();
+              toast("SN512A preset selected. Save changes, then Play.");
+          });
+          LinearLayout.LayoutParams sn512aParams = new LinearLayout.LayoutParams(
+              ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+          sn512aParams.topMargin = dp(10);
+          card.addView(sn512aPreset, sn512aParams);
+          '''
+              anchor='Button reset = button("RESET TO DEFAULT", false);'
+              source=once(source,anchor,preset+anchor,'preset button')
+              assert source.count(TAG)>=3
+              assert source.count('new GraphicsSetting(') > 20
+              return source
+          
+          def main() -> None:
+              if not TARGET.is_file():
+                  raise SystemExit(f'Missing {TARGET}; check upstream branch')
+              original=TARGET.read_text(encoding='utf-8')
+              updated=apply(original)
+              if updated!=original:
+                  TARGET.write_text(updated,encoding='utf-8',newline='\n')
+              print(f'Launcher patch applied; {updated.count("new GraphicsSetting(")} settings; '
+                    f'{len(updated)} Java chars')
+          
+          if __name__=='__main__':
+              main()
+          PY
+          python "sn512a_patch_launcher.py"
+          git diff --stat
+          git diff --check
+          # Fail if patch made no changes.
+          git diff --quiet -- os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java && exit 1 || true
+      - name: Add SN512A CPU scheduling policy to game process
+        run: |
+          cat > sn512a_patch_cpu_scheduler.py <<'PY'
+          #!/usr/bin/env python3
+          """Patch the upstream Mali branch for an optional, app-local CPU scheduler.
+          Fails safely on upstream drift. Runtime mode is consumed by Android Java,
+          not passed as an unknown cvar into the game engine.
+          """
+          from pathlib import Path
+          
+          ROOT=Path('os/android/app/src/main/java/com/libertyrecomp')
+          L=ROOT/'LauncherActivity.java'
+          A=ROOT/'LibertyActivity.java'
+          TAG='SN512A-CPU-SCHED-V2'
+          
+          def once(src, old, new, label):
+              n=src.count(old)
+              if n!=1: raise RuntimeError(f'{label}: expected 1 anchor, found {n}')
+              return src.replace(old,new,1)
+          
+          def modify_launcher(src):
+              if TAG in src: return src
+              setting='''// SN512A-CPU-SCHED-V2: Experimental native thread-priority policy.
+                      new GraphicsSetting("SN512A CPU scheduler",
+                              "Prioritize audio and recognized render/texture threads; Android still schedules cores",
+                              new String[] {"sn512a_cpu_mode"},
+                              new String[] {"Default (balanced on SN512A)", "Off", "Balanced", "Performance"},
+                              new String[] {"off", "balanced", "performance"}),
+                      '''
+              src=once(src,'new GraphicsSetting("Touch controls",',setting+'new GraphicsSetting("Touch controls",','launcher menu anchor')
+              # Put the new selector alongside the already present performance controls.
+              src=once(src,'case "Pin hot CPU threads":', 'case "SN512A CPU scheduler":\n            case "Pin hot CPU threads":','performance tab')
+              return src
+          
+          def modify_activity(src):
+              if TAG in src: return src
+              src=once(src,'private String[] mArguments = new String[0];',
+                       'private String[] mArguments = new String[0];\n'
+                       '    // SN512A-CPU-SCHED-V2: local Java policy, not a GTA cvar.\n'
+                       '    private String mSn512aCpuMode = "off";\n'
+                       '    private Sn512aCpuScheduler mSn512aScheduler;', 'activity field')
+              src=once(src,'super.onCreate(savedInstanceState);',
+                       'super.onCreate(savedInstanceState);\n'
+                       '        if (!"off".equals(mSn512aCpuMode)) {\n'
+                       '            mSn512aScheduler = new Sn512aCpuScheduler(mSn512aCpuMode);\n'
+                       '            mSn512aScheduler.start();\n'
+                       '        }','activity startup')
+              src=once(src,'    /**\n     * Picks the Vulkan driver before SDL loads libmain.so;',
+                       '    @Override\n'
+                       '    protected void onDestroy() {\n'
+                       '        if (mSn512aScheduler != null) mSn512aScheduler.stop();\n'
+                       '        super.onDestroy();\n'
+                       '    }\n'
+                       '    /**\n     * Picks the Vulkan driver before SDL loads libmain.so;', 'activity teardown')
+              src=once(src,'mArguments = withoutDuplicateOptions(arguments).toArray(new String[0]);',
+                       '''// SN512A-CPU-SCHED-V2: consume Java-side setting before native parsing.
+                  // Existing graphics.txt selections override args.txt, if present.
+                  String requestedCpuMode = null;
+                  for (String arg : arguments) {
+                      if (arg.startsWith("--sn512a_cpu_mode=")) {
+                          requestedCpuMode = arg.substring("--sn512a_cpu_mode=".length());
+                      }
+                  }
+                  arguments.removeIf(arg -> arg.startsWith("--sn512a_cpu_mode="));
+                  // Enabled by default only on the tested MediaTek device family.
+                  boolean sn512a = "SN512A".equalsIgnoreCase(Build.MODEL)
+                          && "mt6835".equalsIgnoreCase(Build.HARDWARE);
+                  String chosen = requestedCpuMode != null ? requestedCpuMode : (sn512a ? "balanced" : "off");
+                  mSn512aCpuMode = ("balanced".equals(chosen) || "performance".equals(chosen))
+                          ? chosen : "off";
+                  Log.i(TAG, "SN512A CPU policy=" + mSn512aCpuMode);
+                  mArguments = withoutDuplicateOptions(arguments).toArray(new String[0]);''', 'native arg handoff')
+              return src
+          
+          def main():
+              for path in [L,A]:
+                  if not path.is_file(): raise SystemExit(f'Missing {path}; branch/path mismatch')
+              old_l=L.read_text(encoding='utf8'); old_a=A.read_text(encoding='utf8')
+              new_l=modify_launcher(old_l); new_a=modify_activity(old_a)
+              if TAG not in new_l or TAG not in new_a: raise SystemExit('CPU patch marker missing')
+              # Only write after *both* modifications validate, to avoid half-patching.
+              L.write_text(new_l,encoding='utf8',newline='\n'); A.write_text(new_a,encoding='utf8',newline='\n')
+              sched=Path(__file__).resolve().parent/'Sn512aCpuScheduler.java'
+              target=ROOT/sched.name
+              target.write_bytes(sched.read_bytes())
+              print('SN512A CPU scheduler v2: launcher + activity + scheduler patched')
+          
+          if __name__=='__main__': main()
+          PY
+          cat > Sn512aCpuScheduler.java <<'JAVA'
+          package com.libertyrecomp;
+          
+          import android.os.Process;
+          import android.util.Log;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
+          
+          /**
+           * SN512A experiment: modest thread-priority hints, not hard core assignments.
+           * Android remains responsible for assigning threads to the eight CPU cores.
+           * This cannot parallelize GTA's single-thread-dependent physics or game logic.
+           * Only act on recognizable game-owned native thread names; never change
+           * Android, Binder, GC, driver, or unrelated app threads.
+           */
+          final class Sn512aCpuScheduler implements Runnable {
+              private static final String TAG = "SN512A-CPU";
+              private final boolean performance;
+              private final Map<Integer, Integer> applied = new HashMap<>();
+              private volatile boolean running;
+              private Thread monitor;
+          
+              Sn512aCpuScheduler(String mode) {
+                  this.performance = "performance".equals(mode);
+              }
+          
+              synchronized void start() {
+                  if (running) return;
+                  running = true;
+                  monitor = new Thread(this, "SN512A-CPU-Monitor");
+                  // The monitor must not contend with game-critical work.
+                  monitor.setPriority(Thread.MIN_PRIORITY);
+                  monitor.setDaemon(true);
+                  monitor.start();
+                  Log.i(TAG, "CPU priority experiment active, mode=" + (performance ? "performance" : "balanced"));
+              }
+          
+              synchronized void stop() {
+                  running = false;
+                  if (monitor != null) monitor.interrupt();
+              }
+          
+              @Override public void run() {
+                  // Android applies affinity and performance hints through its own scheduler;
+                  // this code only requests a priority for known native game threads.
+                  while (running) {
+                      try {
+                          scan();
+                          Thread.sleep(1500);
+                      } catch (InterruptedException ignored) {
+                          break;
+                      } catch (Exception e) {
+                          Log.w(TAG, "scan skipped: " + e.getClass().getSimpleName());
+                          try { Thread.sleep(3000); } catch (InterruptedException stop) { break; }
+                      }
+                  }
+                  applied.clear();
+              }
+          
+              private void scan() {
+                  File[] tasks = new File("/proc/self/task").listFiles();
+                  if (tasks == null) return;
+                  Map<Integer, Integer> currentIds = new HashMap<>();
+                  for (File task : tasks) {
+                      final int tid;
+                      try { tid = Integer.parseInt(task.getName()); }
+                      catch (NumberFormatException ignored) { continue; }
+                      currentIds.put(tid, 1);
+                      String name = readFirstLine(new File(task, "comm"));
+                      if (name == null) continue;
+                      int requested = desiredNice(name);
+                      if (requested == Integer.MAX_VALUE) continue;
+                      // Do not repeatedly reapply identical priorities, or lower a
+                      // priority that the existing engine/audio code has already raised.
+                      try {
+                          int existing = Process.getThreadPriority(tid);
+                          if (existing <= requested) continue;
+                          Integer prior = applied.get(tid);
+                          if (prior != null && prior <= requested) continue;
+                          Process.setThreadPriority(tid, requested);
+                          applied.put(tid, requested);
+                          Log.i(TAG, "nice " + tid + " " + name + " " + existing + " -> " + requested);
+                      } catch (IllegalArgumentException | SecurityException e) {
+                          Log.w(TAG, "priority request denied for " + tid + " (" + name + ")");
+                      } catch (RuntimeException e) {
+                          Log.w(TAG, "priority request failed: " + e.getClass().getSimpleName());
+                      }
+                  }
+                  applied.keySet().retainAll(currentIds.keySet());
+              }
+          
+              /** Lower nice means higher priority; existing -16 audio priority is preserved. */
+              private int desiredNice(String original) {
+                  String name = original.trim().toLowerCase(Locale.ROOT);
+                  // Android thread names may be truncated to 15 characters in comm.
+                  if (name.equals("audio worker") || name.startsWith("xma decoder") ||
+                          name.startsWith("audio decode")) return -16;
+                  if (name.startsWith("gtarecorder") || name.startsWith("gtaworker") ||
+                          name.startsWith("gta recorder") || name.startsWith("render worker")) {
+                      return performance ? -8 : -5;
+                  }
+                  if (name.startsWith("texture") || name.startsWith("asset") ||
+                          name.startsWith("vertex cache") || name.startsWith("shader worker")) {
+                      return performance ? -3 : -1;
+                  }
+                  return Integer.MAX_VALUE;
+              }
+          
+              private static String readFirstLine(File file) {
+                  try (BufferedReader r = new BufferedReader(new InputStreamReader(
+                          new FileInputStream(file), StandardCharsets.UTF_8))) {
+                      return r.readLine();
+                  } catch (Exception ignored) { return null; }
+              }
+          }
+          JAVA
+          python sn512a_patch_cpu_scheduler.py
+          git diff --check
+          git diff --stat
+          test -s os/android/app/src/main/java/com/libertyrecomp/Sn512aCpuScheduler.java
+      - name: Restore native build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            out/build
+            out/host-tools
+          key: liberty-sn512a-memory-v4.1-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-${{ github.sha }}
+          restore-keys: |
+            liberty-sn512a-memory-v4.1-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-
+      - name: Fetch pinned dependencies and apply patches
+        run: python tools/setup_repo.py
+      - name: SN512A mission crash diagnostics and audio queue stabilization
+        run: |
+          cat > sn512a_mission_audio_patch.py <<'PY'
+          #!/usr/bin/env python3
+          """Source changes for SN512A Liberty 0.5.9.3 Mali branch.
+
+          Fail closed: if the exact anchors aren't found, stop rather than emit an untested APK.
+          This script never reads/writes args.txt, graphics.txt, save files or driver.txt.
+          """
+          from pathlib import Path
+          import re
+
+          AUDIO = Path('glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp')
+          GRAPHICS = Path('glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp')
+          MARKER = 'SN512A-AUDIO-MISSION-20261105'
+
+
+          def require_replace(source, old, new, name):
+              matches = source.count(old)
+              if matches != 1:
+                  raise RuntimeError(f'{name}: expected exactly 1 source anchor; found {matches}. '
+                                     'Source branch may have changed. No source was written.')
+              return source.replace(old, new, 1)
+
+
+          def patch_audio(src):
+              if MARKER in src:
+                  print('audio patch already applied')
+                  return src
+              # Keep mutex held only for accessing queues. Important: do not hold it over
+              # conversion, SDL_PutAudioStreamData, or the producer's semaphore release.
+              src = require_replace(src,
+                  '''    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+              if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {''',
+                  '''    // SN512A-AUDIO-MISSION-20261105: minimize queue mutex contention.
+              float* buffer = nullptr;
+              size_t queue_depth = 0;
+              {
+                std::lock_guard<std::mutex> guard(driver->frames_mutex_);
+                if (!driver->frames_queued_.empty()) {
+                  buffer = driver->frames_queued_.front();
+                  driver->frames_queued_.pop();
+                }
+                queue_depth = driver->frames_queued_.size();
+              }
+              if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {''',
+                  'callback queue extraction')
+              src = require_replace(src,
+                  'silent_fills, silent_fills + filled, driver->frames_queued_.size());',
+                  'silent_fills, silent_fills + filled, queue_depth);',
+                  'callback underrun logging')
+              src = require_replace(src,
+                  '    if (driver->frames_queued_.empty()) {\n      ++silent_fills;',
+                  '    if (!buffer) {\n      ++silent_fills;',
+                  'callback empty check')
+              src = require_replace(src,
+                  '''      ++filled;
+                auto buffer = driver->frames_queued_.front();
+                driver->frames_queued_.pop();
+                if (REXCVAR_GET(audio_mute)) {''',
+                  '''      ++filled;
+                if (REXCVAR_GET(audio_mute)) {''',
+                  'callback consumed frame')
+              # The old v4 script matched one long, exact block here. Small upstream
+              # logging/spacing differences caused the entire GitHub job to fail.
+              # Instead, identify the callback and its TWO distinct recycle sites.
+              callback_begin = src.find('void SDLAudioDriver::SDLCallback(')
+              callback_end = src.find('\n}\n\n}  // namespace rex::audio::sdl', callback_begin)
+              if callback_begin < 0 or callback_end < 0:
+                  raise RuntimeError('SDL callback boundaries not recognized; unsafe to patch')
+              callback = src[callback_begin:callback_end]
+              recycle = re.compile(r'^(?P<ws>[ ]*)driver->frames_unused_\.push\(buffer\);$', re.MULTILINE)
+              if len(list(recycle.finditer(callback))) != 2:
+                  raise RuntimeError('Expected exactly 2 buffer recycle sites inside SDL callback; '
+                                     'upstream source changed; no source was written')
+
+              def lock_recycle(match):
+                  ws = match.group('ws')
+                  return (ws + '{\n' +
+                          ws + '  std::lock_guard<std::mutex> recycle_guard(driver->frames_mutex_);\n' +
+                          ws + '  driver->frames_unused_.push(buffer);\n' +
+                          ws + '}')
+
+              callback = recycle.sub(lock_recycle, callback)
+              # On submission failure, the buffer MUST be returned to the producer.
+              # Match this branch by its unique SDL error marker, rather than exact
+              # surrounding whitespace or the name of the normal-path credit variable.
+              error_release = re.compile(
+                  r'(?P<start>REXAPU_ERROR\("SDL_PutAudioStreamData\(\) failed: \{\}", SDL_GetError\(\)\);)'
+                  r'(?P<middle>[\s\S]{0,700}?)'
+                  r'(?P<ws>^[ ]*)break;', re.MULTILINE)
+              err_matches = list(error_release.finditer(callback))
+              if len(err_matches) != 1 or 'driver->frames_unused_.push(buffer);' not in err_matches[0].group('middle'):
+                  raise RuntimeError('Could not safely locate SDL submit-error recycle branch')
+              def add_error_credit(m):
+                  ws=m.group('ws')
+                  return (m.group('start') + m.group('middle') +
+                          ws + 'const bool returned_credit = driver->semaphore_->Release(1, nullptr);\n' +
+                          ws + 'assert_true(returned_credit);\n' +
+                          ws + 'break;')
+              callback = error_release.sub(add_error_credit, callback, count=1)
+              src = src[:callback_begin] + callback + src[callback_end:]
+              # The producer's first-ten-frame debug statement reads std::queue::size()
+              # without a lock while the callback pops frames. Access it under mutex.
+              pattern = re.compile(
+                  r'(?P<lead>^[ ]*)REXAPU_DEBUG\("SDLAudioDriver::SubmitFrame: frame_ptr=\{:08X\} queued_count=\{\}", frame_ptr,\s*frames_queued_\.size\(\) \+ 1\);',
+                  re.MULTILINE)
+              matches = list(pattern.finditer(src))
+              if len(matches) != 1:
+                  raise RuntimeError(f'submitter debug lock: expected 1 site, got {len(matches)}')
+              lead = matches[0].group('lead')
+              secure = (lead + 'size_t safely_queued = 0;\n' +
+                        lead + '{\n' +
+                        lead + '  std::lock_guard<std::mutex> queue_guard(frames_mutex_);\n' +
+                        lead + '  safely_queued = frames_queued_.size();\n' +
+                        lead + '}\n' +
+                        lead + 'REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,\n' +
+                        lead + '             safely_queued + 1);')
+              src = pattern.sub(lambda _: secure, src, count=1)
+              return src
+
+
+          def patch_graphics(src):
+              if MARKER in src:
+                  print('graphics patch already applied')
+                  return src
+              # 0x00000001 is common as descriptor.address in the crash report. This is
+              # *only* a diagnostic alias scan; image creation remains independent. Skip
+              # the O(N) scan and unbounded error log for this placeholder-style value.
+              # This is NOT a claimed fix for the segmentation fault itself.
+              src = require_replace(src,
+                  '''  std::string same_address_aliases;
+            bool has_written_same_address_alias = false;
+            if (descriptor.address) {''',
+                  '''  std::string same_address_aliases;
+            bool has_written_same_address_alias = false;
+            // SN512A-AUDIO-MISSION-20261105: skip placeholder address 1 in diagnostics.
+            // Dedicated VkImage creation and rendering semantics are unchanged.
+            if (descriptor.address > 1u) {''',
+                  'surface alias diagnostic guard')
+              return src
+
+
+          def main():
+              for path in [AUDIO, GRAPHICS]:
+                  if not path.is_file():
+                      raise SystemExit(f'Missing {path}: checkout / setup mismatch')
+              originals = [p.read_text(encoding='utf8') for p in (AUDIO, GRAPHICS)]
+              # Only write if all anchors for both sources match; avoid partial patches.
+              modified = [patch_audio(originals[0]), patch_graphics(originals[1])]
+              for path, old, new in zip((AUDIO, GRAPHICS), originals, modified):
+                  if new != old:
+                      path.write_text(new, encoding='utf8', newline='\n')
+                  print(f'{path}: {len(old)} -> {len(new)} bytes; changed={new != old}')
+              print('Audio queue lock scope shortened, debug data race removed, '
+                    'and placeholder-address alias diagnostics bypassed.')
+              print('No user settings or files were modified by this patch script.')
+
+
+          if __name__ == '__main__':
+              main()
+          PY
+          python sn512a_mission_audio_patch.py
+          git diff --check
+          git diff --stat
+          # Critical assertion: preserve existing user launch settings and system-driver selection.
+          test -n "$(grep -l 'SN512A-AUDIO-MISSION-20261105' glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp)"
+          test -n "$(grep -l 'SN512A-AUDIO-MISSION-20261105' glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp)"
+          # Print source hashes for reproducibility and later crash symbol matching.
+          python - <<'PYHASH'
+          from pathlib import Path
+          import hashlib
+          for p in [Path('glue/rexglue-sdk-main/src/audio/sdl/sdl_audio_driver.cpp'),Path('glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp')]:
+              print('patched',p,'sha256=',hashlib.sha256(p.read_bytes()).hexdigest())
+          PYHASH
+      - name: SN512A memory reduction + audio-friendly texture decoding (v4)
+        run: |
+          cat > sn512a_memory_audio_v4_patch.py <<'PY'
+          #!/usr/bin/env python3
+          """Experimental, fail-closed SN512A v4 patch to the ZMOD Liberty Mali checkout.
+          
+          Apply after tools/setup_repo.py and after v3 mission/audio/source fixes.
+          It changes source defaults, *not* any Android/data user configuration files.
+          """
+          from pathlib import Path
+          
+          GRAPHICS = Path('glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp')
+          POOL = Path('glue/rexglue-sdk-main/src/graphics/gta4_native/native_bc_decode.h')
+          AUDIO_SYSTEM = Path('glue/rexglue-sdk-main/src/audio/audio_system.cpp')
+          LAUNCHER = Path('os/android/app/src/main/java/com/libertyrecomp/LauncherActivity.java')
+          MARKER = 'SN512A-MEMORY-AUDIO-V4'
+          
+          
+          def replace_once(source: str, original: str, new: str, label: str) -> str:
+              occurrences = source.count(original)
+              if occurrences != 1:
+                  raise RuntimeError(f'{label}: expected 1 matching source anchor, got {occurrences}. '
+                                     'Upstream may have changed. No files have been modified.')
+              return source.replace(original, new, 1)
+          
+          
+          def patch_graphics(src: str) -> str:
+              if MARKER in src:
+                  return src
+          
+              # Cap only the native Vulkan sampled-texture cache (not all game memory).
+              # Users' existing cvar overrides still take precedence over this fallback.
+              src = replace_once(
+                  src,
+                  'gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",',
+                  'gta4_native_texture_memory_limit_mb, REX_PLATFORM_ANDROID ? 384 : 0, '
+                  '"GTA IV/Graphics/Native Renderer",',
+                  'Android-only default native texture cache budget')
+          
+              src = replace_once(
+                  src,
+                  'namespace rex::graphics::gta4_native {\nnamespace {',
+                  '''// SN512A-MEMORY-AUDIO-V4: Lower-memory fallback for BC2/BC3 on non-BC Vulkan GPUs.
+          // Re-encoding to ASTC is intentionally NOT implemented by this switch.
+          // This 4-4-4-4 path is lossy; keep it user-configurable and capability-checked.
+          REXCVAR_DEFINE_BOOL(gta4_mali_dxt35_rgba4, true, "GTA IV/Graphics/Native Renderer",
+                              "On BC-incompatible GPUs, decode BC2/BC3 to 16-bit RGBA4 instead of 32-bit RGBA8")
+              .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+          namespace rex::graphics::gta4_native {
+          namespace {''',
+                  'experimental graphics cvar')
+          
+              src = replace_once(
+                  src,
+                  'std::atomic<bool> g_decode_dxt1_to_a1r5g5b5{false};',
+                  '''std::atomic<bool> g_decode_dxt1_to_a1r5g5b5{false};
+          // SN512A-MEMORY-AUDIO-V4: BC2/BC3 to 16-bit RGBA4 where sampled+upload supported.
+          std::atomic<bool> g_decode_dxt35_to_rgba4{false};
+          // Decode one 4x4 BC2 or BC3 block into a small scratch area, then quantize
+          // 8-bit RGBA channels to 4 bits each and write the *Vulkan R4G4B4A4* order.
+          // BC2/3 are 16 bytes/4x4; RGBA4 is 32 bytes/4x4 instead of RGBA8's 64.
+          inline void DecodeDxt35ToR4G4B4A4(xenos::TextureFormat base_format, xenos::Endian endian,
+                                              void* destination, const void* source, size_t pitch) {
+            uint8_t rgba[4 * 4 * 4] = {};
+            if (base_format == xenos::TextureFormat::k_DXT2_3) {
+              texture_conversion::ConvertTexelDXT2_3ToR8G8B8A8(endian, rgba, source, 4 * 4);
+            } else {
+              texture_conversion::ConvertTexelDXT4_5ToR8G8B8A8(endian, rgba, source, 4 * 4);
+            }
+            auto* output = static_cast<uint8_t*>(destination);
+            for (size_t y = 0; y < 4; ++y) {
+              for (size_t x = 0; x < 4; ++x) {
+                const uint8_t* color = rgba + (y * 4 + x) * 4;
+                const uint16_t packed = uint16_t((uint16_t(color[0] >> 4) << 12) |
+                                                 (uint16_t(color[1] >> 4) << 8) |
+                                                 (uint16_t(color[2] >> 4) << 4) |
+                                                 uint16_t(color[3] >> 4));
+                std::memcpy(output + y * pitch + x * 2, &packed, sizeof(packed));
+              }
+            }
+          }''',
+                  'DXT3/5 quantizer helper')
+          
+              src = replace_once(
+                  src,
+                  '''  const bool dxt1_16bit = !supported && format_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+            g_decode_dxt_textures.store(!supported, std::memory_order_relaxed);
+            g_decode_dxt1_to_a1r5g5b5.store(dxt1_16bit, std::memory_order_relaxed);''',
+                  '''  const bool dxt1_16bit = !supported && format_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+            const bool dxt35_16bit = !supported && REXCVAR_GET(gta4_mali_dxt35_rgba4) &&
+                                     format_usable(VK_FORMAT_R4G4B4A4_UNORM_PACK16);
+            g_decode_dxt_textures.store(!supported, std::memory_order_relaxed);
+            g_decode_dxt1_to_a1r5g5b5.store(dxt1_16bit, std::memory_order_relaxed);
+            g_decode_dxt35_to_rgba4.store(dxt35_16bit, std::memory_order_relaxed);''',
+                  'Vulkan format capability selection')
+          
+              src = replace_once(
+                  src,
+                  '''                 "CPU (DXT1 to {}, DXT3/DXT5 to R8G8B8A8)",
+                           dxt1_16bit ? "A1R5G5B5" : "R8G8B8A8");''',
+                  '''                 "CPU (DXT1 to {}, DXT3/DXT5 to {})",
+                           dxt1_16bit ? "A1R5G5B5" : "R8G8B8A8",
+                           dxt35_16bit ? "R4G4B4A4" : "R8G8B8A8");''',
+                  'DXT cache conversion logging')
+          
+              src = replace_once(
+                  src,
+                  '''  if (IsDecodedDxtFormat(GetBaseFormat(format))) {
+              return GetBaseFormat(format) == xenos::TextureFormat::k_DXT1 &&
+                             g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed)
+                         ? VK_FORMAT_A1R5G5B5_UNORM_PACK16
+                         : VK_FORMAT_R8G8B8A8_UNORM;
+            }''',
+                  '''  if (IsDecodedDxtFormat(GetBaseFormat(format))) {
+              const auto base = GetBaseFormat(format);
+              if (base == xenos::TextureFormat::k_DXT1 &&
+                  g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed)) {
+                return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+              }
+              if ((base == xenos::TextureFormat::k_DXT2_3 ||
+                   base == xenos::TextureFormat::k_DXT4_5) &&
+                  g_decode_dxt35_to_rgba4.load(std::memory_order_relaxed)) {
+                return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+              }
+              return VK_FORMAT_R8G8B8A8_UNORM;
+            }''',
+                  'texture-to-Vulkan format mapping')
+          
+              src = replace_once(
+                  src,
+                  '''  const bool decode_dxt1_16bit = decode_dxt && base_format == xenos::TextureFormat::k_DXT1 &&
+                                            g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed);
+            const FormatInfo* host_format_info =
+                decode_dxt1_16bit ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_1_5_5_5))
+                : decode_dxt     ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_8_8_8_8))''',
+                  '''  const bool decode_dxt1_16bit = decode_dxt && base_format == xenos::TextureFormat::k_DXT1 &&
+                                            g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed);
+            const bool decode_dxt35_16bit = decode_dxt &&
+                (base_format == xenos::TextureFormat::k_DXT2_3 ||
+                 base_format == xenos::TextureFormat::k_DXT4_5) &&
+                g_decode_dxt35_to_rgba4.load(std::memory_order_relaxed);
+            const FormatInfo* host_format_info =
+                decode_dxt1_16bit ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_1_5_5_5))
+                : decode_dxt35_16bit ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_4_4_4_4))
+                : decode_dxt     ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_8_8_8_8))''',
+                  'texture memory layout/bytes per texel')
+          
+              src = replace_once(
+                  src,
+                  '''                 if (decode_dxt1_16bit) {
+                             texture_conversion::ConvertTexelDXT1ToA1R5G5B5(info.endianness, texels,
+                                                                            source_block, destination_pitch);
+                           } else if (base_format == xenos::TextureFormat::k_DXT1) {''',
+                  '''                 if (decode_dxt1_16bit) {
+                             texture_conversion::ConvertTexelDXT1ToA1R5G5B5(info.endianness, texels,
+                                                                            source_block, destination_pitch);
+                           } else if (decode_dxt35_16bit) {
+                             DecodeDxt35ToR4G4B4A4(base_format, info.endianness, texels,
+                                                    source_block, destination_pitch);
+                           } else if (base_format == xenos::TextureFormat::k_DXT1) {''',
+                  'on-demand 16-bit texture decode')
+          
+              assert src.count('SN512A-MEMORY-AUDIO-V4') >= 2
+              return src
+          
+          
+          def patch_pool(src: str) -> str:
+              if MARKER in src:
+                  return src
+              return replace_once(
+                  src,
+                  '    worker_count_ = cores > 2 ? std::min(cores - 1, 6u) : 0;',
+                  '''    // SN512A-MEMORY-AUDIO-V4: leave CPU headroom for guest audio mixing,
+              // XMA decode and graphics; the calling thread also participates.
+              worker_count_ = cores > 2 ? std::min(cores - 2, 3u) : 0;''',
+                  'BC texture decode worker cap')
+          
+          
+          
+          def patch_audio_system(src: str) -> str:
+              if MARKER in src:
+                  return src
+              # WaitAny has already blocked for up to 500 ms. A SECOND 500 ms sleep on
+              # timeout makes the guest mixer unresponsive when a producer resumes in
+              # that second sleep. Only back off briefly on *failed* waits.
+              return replace_once(
+                  src,
+                  '''    if (!pumped) {
+                SCOPE_profile_cpu_i("apu", "Sleep");
+                rex::thread::Sleep(std::chrono::milliseconds(500));
+              }''',
+                  '''    // SN512A-MEMORY-AUDIO-V4: WaitAny() itself blocks on normal timeout.
+              // Don't add a second 500 ms sleep that delays newly ready audio frames.
+              if (!pumped && result.first == rex::thread::WaitResult::kFailed) {
+                SCOPE_profile_cpu_i("apu", "Audio wait failure backoff");
+                rex::thread::Sleep(std::chrono::milliseconds(1));
+              }''',
+                  'audio producer timeout wakeup')
+          
+          
+          def patch_launcher(src: str) -> str:
+              if MARKER in src:
+                  return src
+              return replace_once(
+                  src,
+                  'new GraphicsSetting("Touch controls",',
+                  '''// SN512A-MEMORY-AUDIO-V4: opt-out switches. Existing saved selections untouched.
+                    new GraphicsSetting("16-bit alpha textures", "Reduce decoded DXT3/5 memory; possible color/alpha banding",
+                        new String[] {"gta4_mali_dxt35_rgba4"},
+                        new String[] {"Default", "Save RAM (16-bit)", "Original color (32-bit)"},
+                        new String[] {"true", "false"}),
+                    new GraphicsSetting("GPU texture cache budget", "Limits sampled-texture cache; small cap may increase pop-in",
+                        new String[] {"gta4_native_texture_memory_limit_mb"},
+                        new String[] {"Default", "256 MB", "384 MB", "512 MB", "768 MB", "Driver budget"},
+                        new String[] {"256", "384", "512", "768", "0"}),
+                    new GraphicsSetting("Touch controls",''',
+                  'memory controls in GUI')
+          
+          
+          def main() -> None:
+              paths = [GRAPHICS, POOL, AUDIO_SYSTEM, LAUNCHER]
+              missing = [str(p) for p in paths if not p.is_file()]
+              if missing:
+                  raise SystemExit('Missing expected checkout file(s): ' + ', '.join(missing))
+              originals = [p.read_text(encoding='utf8') for p in paths]
+              modifications = [patch_graphics(originals[0]), patch_pool(originals[1]),
+                               patch_audio_system(originals[2]), patch_launcher(originals[3])]
+              # Fail-closed: modifications all checked before writing anything.
+              for p, before, after in zip(paths, originals, modifications):
+                  if before != after:
+                      p.write_text(after, encoding='utf8', newline='\n')
+                  print(f'{p}: changed={before != after}; bytes={len(before)} -> {len(after)}')
+              print('V4 16-bit DXT3/DXT5 decode, bounded texture cache, audio decoder headroom and shorter mixer timeout.')
+              print('Android/data and all user graphics/args/audio settings are untouched.')
+          
+          
+          if __name__ == '__main__':
+              main()
+          PY
+          python sn512a_memory_audio_v4_patch.py
+          git diff --check
+          git diff --stat
+          grep -Fq 'SN512A-MEMORY-AUDIO-V4' glue/rexglue-sdk-main/src/graphics/gta4_native/graphics_system.cpp
+          grep -Fq 'SN512A-MEMORY-AUDIO-V4' glue/rexglue-sdk-main/src/graphics/gta4_native/native_bc_decode.h
+          grep -Fq 'SN512A-MEMORY-AUDIO-V4' glue/rexglue-sdk-main/src/audio/audio_system.cpp
+      - name: Build Vulkan driver proxy
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          bash os/android/scripts/build_driver_proxy.sh
+      - name: Build native game and renderer
+        timeout-minutes: 320
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          bash os/android/scripts/build_native.sh
+      - name: Save native cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            out/build
+            out/host-tools
+          key: liberty-sn512a-memory-v4.1-${{ runner.os }}-${{ env.LIBERTY_GPU }}-${{ env.LIBERTY_CPU }}-${{ github.sha }}
+      - name: Build debug APK
+        run: |
+          export ANDROID_HOME="$(cygpath -u "$ANDROID_HOME")"
+          export JAVA_HOME="$(cygpath -u "$JAVA_HOME")"
+          rm -f os/android/app/build/outputs/apk/debug/app-debug.apk
+          bash os/android/scripts/build_apk.sh debug
+          test -s os/android/app/build/outputs/apk/debug/app-debug.apk
+          cp os/android/app/build/outputs/apk/debug/app-debug.apk Liberty-SN512A-MemoryAudio-v4.1-EXPERIMENTAL.apk
+      - name: Upload experimental Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liberty-SN512A-MemoryAudio-v4.1-EXPERIMENTAL
+          path: Liberty-SN512A-MemoryAudio-v4.1-EXPERIMENTAL.apk
+          if-no-files-found: error
+          retention-days: 30
